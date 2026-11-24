@@ -1,0 +1,737 @@
+# Construit l'APK de la tablette (application "Écran cantine") et le publie dans l'onglet Releases du dépôt.
+# Mode d'emploi : voir les explications données avec ce fichier.
+# Aucune donnée personnelle, aucun secret : le code de l'application est entièrement contenu dans ce fichier.
+name: Construire l'APK de la tablette
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Creer le projet Android
+        run: |
+          set -e
+          mkdir -p ecran/app ecran/app/src/main ecran/app/src/main/java/fr/cantine/ecran
+          cat > ecran/settings.gradle <<'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "EcranCantine"
+          include ':app'
+          EOF_FILE
+          cat > ecran/build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+          }
+          EOF_FILE
+          cat > ecran/gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          EOF_FILE
+          cat > ecran/app/build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'fr.cantine.ecran'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'fr.cantine.ecran'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          EOF_FILE
+          cat > ecran/app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- Bluetooth classique uniquement. Aucun acces Internet, micro, position ni fichier. -->
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Écran cantine"
+                  android:supportsRtl="false"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
+                      android:exported="true"
+                      android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > ecran/app/src/main/java/fr/cantine/ecran/MainActivity.java <<'EOF_FILE'
+          package fr.cantine.ecran;
+
+          import android.animation.ArgbEvaluator;
+          import android.animation.ValueAnimator;
+          import android.app.Activity;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothServerSocket;
+          import android.bluetooth.BluetoothSocket;
+          import android.content.Context;
+          import android.content.res.Configuration;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.graphics.Typeface;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.DisplayMetrics;
+          import android.util.TypedValue;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          import org.json.JSONArray;
+          import org.json.JSONException;
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.IOException;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.util.UUID;
+
+          /**
+           * Ecran cantine : affiche exactement ce que le telephone envoie par Bluetooth classique (RFCOMM).
+           * Aucun reglage, aucune mesure, aucun son. La tablette recoit uniquement l'etat, les couleurs et les textes.
+           */
+          public class MainActivity extends Activity {
+
+              static final UUID SERVICE_UUID = UUID.fromString("5f3c2a10-8b6e-4d7a-9c41-2e6f0b7a1d93");
+              static final String SERVICE_NAME = "Ecran cantine";
+              static final long LINK_TIMEOUT_MS = 8000;
+              static final int NEUTRAL_BG = 0xFFE8EEF3;
+              static final int NEUTRAL_INK = 0xFF1F3A4D;
+              static final int NEUTRAL_ICON = 0xFF4B6B80;
+              static final String DEFAULT_SIGNATURE = "Bien manger, bien parler, bien vivre ensemble.";
+              static final String WAIT_PHONE = "Connexion avec le téléphone…";
+              private static final byte[] OK_BYTES = new byte[] { 'o', 'k', '\n' };
+              private static final int MATCH = LinearLayout.LayoutParams.MATCH_PARENT;
+              private static final int WRAP = LinearLayout.LayoutParams.WRAP_CONTENT;
+
+              private final Handler ui = new Handler(Looper.getMainLooper());
+
+              private FrameLayout root;
+              private FrameLayout stage;
+              private LinearLayout content;
+              private IconView icon;
+              private TextView title;
+              private LinearLayout linesBox;
+              private TextView signature;
+
+              private int shownBg = NEUTRAL_BG;
+              private int targetBg = NEUTRAL_BG;
+              private ValueAnimator bgAnim = null;
+              private String curState = "";
+              private String lastRaw = null;
+              private String lastWait = null;
+              private JSONObject shown = null;
+              private JSONObject pending = null;
+              private boolean fading = false;
+              private LinkThread link = null;
+
+              private final Runnable watchdog = new Runnable() {
+                  @Override
+                  public void run() {
+                      LinkThread l = link;
+                      if (l != null && l.connected && System.currentTimeMillis() - l.lastLine > LINK_TIMEOUT_MS) {
+                          l.dropSocket();
+                      }
+                      ui.postDelayed(this, 1000);
+                  }
+              };
+
+              private final Runnable refit = new Runnable() {
+                  @Override
+                  public void run() {
+                      fit();
+                  }
+              };
+
+              private int dp(float v) {
+                  return Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics()));
+              }
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+                  root = new FrameLayout(this);
+                  root.setBackgroundColor(NEUTRAL_BG);
+
+                  LinearLayout column = new LinearLayout(this);
+                  column.setOrientation(LinearLayout.VERTICAL);
+                  root.addView(column, new FrameLayout.LayoutParams(MATCH, MATCH));
+
+                  stage = new FrameLayout(this);
+                  column.addView(stage, new LinearLayout.LayoutParams(MATCH, 0, 1f));
+
+                  content = new LinearLayout(this);
+                  content.setOrientation(LinearLayout.VERTICAL);
+                  content.setGravity(Gravity.CENTER_HORIZONTAL);
+                  stage.addView(content, new FrameLayout.LayoutParams(MATCH, WRAP, Gravity.CENTER));
+
+                  icon = new IconView(this);
+                  content.addView(icon, new LinearLayout.LayoutParams(1, 1));
+
+                  title = new TextView(this);
+                  title.setGravity(Gravity.CENTER);
+                  title.setTypeface(Typeface.DEFAULT_BOLD);
+                  title.setLetterSpacing(0.03f);
+                  content.addView(title, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+                  linesBox = new LinearLayout(this);
+                  linesBox.setOrientation(LinearLayout.VERTICAL);
+                  linesBox.setGravity(Gravity.CENTER_HORIZONTAL);
+                  content.addView(linesBox, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+                  signature = new TextView(this);
+                  signature.setGravity(Gravity.CENTER);
+                  column.addView(signature, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+                  setContentView(root);
+                  showWaiting(WAIT_PHONE);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  hideSystemUi();
+                  link = new LinkThread();
+                  link.start();
+                  ui.removeCallbacks(watchdog);
+                  ui.postDelayed(watchdog, 1000);
+              }
+
+              @Override
+              protected void onPause() {
+                  ui.removeCallbacks(watchdog);
+                  if (link != null) {
+                      link.shutdown();
+                      link = null;
+                  }
+                  super.onPause();
+              }
+
+              @Override
+              public void onWindowFocusChanged(boolean hasFocus) {
+                  super.onWindowFocusChanged(hasFocus);
+                  if (hasFocus) {
+                      hideSystemUi();
+                  }
+              }
+
+              @Override
+              public void onConfigurationChanged(Configuration newConfig) {
+                  super.onConfigurationChanged(newConfig);
+                  stage.post(refit);
+              }
+
+              /** Les enfants ne peuvent pas quitter l'ecran avec le bouton Retour. */
+              @Override
+              public void onBackPressed() {
+              }
+
+              private void hideSystemUi() {
+                  getWindow().getDecorView().setSystemUiVisibility(
+                          View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                                  | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                                  | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                                  | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                  | View.SYSTEM_UI_FLAG_FULLSCREEN
+                                  | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+              }
+
+              // ------------------------------------------------------------------ affichage
+
+              private static int parseColor(String s, int fallback) {
+                  try {
+                      return Color.parseColor(s);
+                  } catch (Exception e) {
+                      return fallback;
+                  }
+              }
+
+              private JSONObject waitModel(String line) {
+                  JSONObject m = new JSONObject();
+                  try {
+                      m.put("s", "wait");
+                      m.put("bg", "#e8eef3");
+                      m.put("ink", "#1f3a4d");
+                      m.put("ic", "#4b6b80");
+                      m.put("i", "");
+                      m.put("t", "EN ATTENTE");
+                      JSONArray l = new JSONArray();
+                      JSONObject o = new JSONObject();
+                      o.put("x", line);
+                      o.put("b", 0);
+                      l.put(o);
+                      m.put("l", l);
+                      m.put("g", DEFAULT_SIGNATURE);
+                  } catch (JSONException e) {
+                      // ne peut pas arriver avec des cles fixes
+                  }
+                  return m;
+              }
+
+              private void showWaiting(String line) {
+                  lastRaw = null;
+                  if (line.equals(lastWait) && "wait".equals(curState)) {
+                      return;
+                  }
+                  lastWait = line;
+                  applyModel(waitModel(line));
+              }
+
+              private void onLine(String raw) {
+                  if (raw.equals(lastRaw)) {
+                      return;
+                  }
+                  try {
+                      JSONObject m = new JSONObject(raw);
+                      lastRaw = raw;
+                      lastWait = null;
+                      applyModel(m);
+                  } catch (JSONException e) {
+                      // ligne illisible : ignoree
+                  }
+              }
+
+              private void applyModel(JSONObject m) {
+                  String s = m.optString("s", "");
+                  animateBackground(parseColor(m.optString("bg", ""), NEUTRAL_BG));
+                  if (fading) {
+                      pending = m;
+                  } else if (shown != null && !s.equals(curState)) {
+                      pending = m;
+                      fading = true;
+                      content.animate().alpha(0f).setDuration(350).withEndAction(new Runnable() {
+                          @Override
+                          public void run() {
+                              fading = false;
+                              JSONObject next = pending;
+                              pending = null;
+                              if (next != null) {
+                                  show(next);
+                                  content.animate().alpha(1f).setDuration(800).start();
+                              }
+                          }
+                      }).start();
+                  } else {
+                      show(m);
+                  }
+              }
+
+              private void animateBackground(int bg) {
+                  if (bg == targetBg) {
+                      return;
+                  }
+                  targetBg = bg;
+                  if (bgAnim != null) {
+                      bgAnim.cancel();
+                  }
+                  bgAnim = ValueAnimator.ofObject(new ArgbEvaluator(), shownBg, bg);
+                  bgAnim.setDuration(1600);
+                  bgAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+                      @Override
+                      public void onAnimationUpdate(ValueAnimator a) {
+                          shownBg = (Integer) a.getAnimatedValue();
+                          root.setBackgroundColor(shownBg);
+                      }
+                  });
+                  bgAnim.start();
+              }
+
+              private void show(JSONObject m) {
+                  int ink = parseColor(m.optString("ink", ""), NEUTRAL_INK);
+                  int ic = parseColor(m.optString("ic", ""), NEUTRAL_ICON);
+                  icon.setKind(m.optString("i", ""), ic);
+                  title.setText(m.optString("t", ""));
+                  title.setTextColor(ink);
+                  linesBox.removeAllViews();
+                  JSONArray arr = m.optJSONArray("l");
+                  if (arr != null) {
+                      for (int i = 0; i < arr.length(); i++) {
+                          JSONObject o = arr.optJSONObject(i);
+                          if (o == null) {
+                              continue;
+                          }
+                          if (o.optInt("sep", 0) == 1) {
+                              View sep = new View(this);
+                              sep.setBackgroundColor((ink & 0x00FFFFFF) | 0x47000000);
+                              linesBox.addView(sep, new LinearLayout.LayoutParams(1, 1));
+                          } else {
+                              TextView tv = new TextView(this);
+                              tv.setText(o.optString("x", ""));
+                              tv.setTextColor(ink);
+                              tv.setGravity(Gravity.CENTER);
+                              tv.setLineSpacing(0f, 1.12f);
+                              tv.setTypeface(o.optInt("b", 0) == 1 ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
+                              linesBox.addView(tv, new LinearLayout.LayoutParams(MATCH, WRAP));
+                          }
+                      }
+                  }
+                  signature.setText(m.optString("g", DEFAULT_SIGNATURE));
+                  signature.setTextColor((ink & 0x00FFFFFF) | 0xCC000000);
+                  shown = m;
+                  curState = m.optString("s", "");
+                  stage.post(refit);
+              }
+
+              /** Tailles proportionnelles a l'ecran (comme sur le telephone), reduites si le contenu depasse. */
+              private void fit() {
+                  int stageW = stage.getWidth();
+                  int stageH = stage.getHeight();
+                  if (stageW <= 0 || stageH <= 0) {
+                      stage.post(refit);
+                      return;
+                  }
+                  DisplayMetrics dm = getResources().getDisplayMetrics();
+                  float s = 1f;
+                  for (int i = 0; i < 14; i++) {
+                      applySizes(dm.widthPixels, dm.heightPixels, s);
+                      content.measure(
+                              View.MeasureSpec.makeMeasureSpec(stageW, View.MeasureSpec.EXACTLY),
+                              View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+                      if (content.getMeasuredHeight() <= stageH * 0.94f) {
+                          break;
+                      }
+                      s *= 0.92f;
+                  }
+                  content.requestLayout();
+              }
+
+              private void applySizes(int sw, int sh, float s) {
+                  float vw = sw / 100f;
+                  float vh = sh / 100f;
+                  float titlePx = Math.min(9.6f * vw, 9.2f * vh) * s;
+                  float textPx = Math.min(6.4f * vw, 5.2f * vh) * s;
+                  int iconPx = Math.round(Math.min(14f * vw, 12f * vh) * s);
+                  int gap = Math.round(2.2f * vh * s);
+                  int pad = Math.round(6f * vw);
+
+                  content.setPadding(pad, 0, pad, 0);
+
+                  boolean hasIcon = icon.hasIcon();
+                  icon.setVisibility(hasIcon ? View.VISIBLE : View.GONE);
+                  icon.setLayoutParams(new LinearLayout.LayoutParams(iconPx, iconPx));
+
+                  title.setTextSize(TypedValue.COMPLEX_UNIT_PX, titlePx);
+                  LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                  tlp.topMargin = hasIcon ? gap : 0;
+                  title.setLayoutParams(tlp);
+
+                  for (int i = 0; i < linesBox.getChildCount(); i++) {
+                      View c = linesBox.getChildAt(i);
+                      LinearLayout.LayoutParams lp;
+                      if (c instanceof TextView) {
+                          ((TextView) c).setTextSize(TypedValue.COMPLEX_UNIT_PX, textPx);
+                          lp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                      } else {
+                          lp = new LinearLayout.LayoutParams(Math.round(0.28f * sw), Math.max(2, dp(1.5f)));
+                          lp.gravity = Gravity.CENTER_HORIZONTAL;
+                      }
+                      lp.topMargin = gap;
+                      c.setLayoutParams(lp);
+                  }
+
+                  signature.setTextSize(TypedValue.COMPLEX_UNIT_PX, Math.min(4f * vw, 3.1f * vh));
+                  signature.setPadding(dp(12), dp(4), dp(12), dp(12));
+              }
+
+              // ------------------------------------------------------------------ icones (memes dessins que sur le telephone)
+
+              static class IconView extends View {
+                  private String kind = "";
+                  private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+                  IconView(Context c) {
+                      super(c);
+                      fill.setStyle(Paint.Style.FILL);
+                      stroke.setStyle(Paint.Style.STROKE);
+                      stroke.setStrokeWidth(4.5f);
+                      stroke.setStrokeCap(Paint.Cap.ROUND);
+                      stroke.setStrokeJoin(Paint.Join.ROUND);
+                      setAlpha(0.75f);
+                  }
+
+                  void setKind(String k, int color) {
+                      kind = (k == null) ? "" : k;
+                      fill.setColor(color);
+                      stroke.setColor(color);
+                      invalidate();
+                  }
+
+                  boolean hasIcon() {
+                      return kind.equals("sprout") || kind.equals("waves") || kind.equals("ear");
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas canvas) {
+                      if (!hasIcon()) {
+                          return;
+                      }
+                      float k = Math.min(getWidth(), getHeight()) / 64f;
+                      canvas.save();
+                      canvas.scale(k, k);
+                      if (kind.equals("sprout")) {
+                          Path leaf1 = new Path();
+                          leaf1.moveTo(31f, 38f);
+                          leaf1.cubicTo(17f, 38f, 10f, 30f, 10f, 18f);
+                          leaf1.cubicTo(23f, 18f, 31f, 25f, 31f, 38f);
+                          leaf1.close();
+                          Path leaf2 = new Path();
+                          leaf2.moveTo(33f, 31f);
+                          leaf2.cubicTo(33f, 18f, 41f, 10f, 54f, 10f);
+                          leaf2.cubicTo(54f, 23f, 46f, 31f, 33f, 31f);
+                          leaf2.close();
+                          canvas.drawRect(30.5f, 32f, 33.5f, 58f, fill);
+                          canvas.drawPath(leaf1, fill);
+                          canvas.drawPath(leaf2, fill);
+                      } else if (kind.equals("waves")) {
+                          Path p1 = new Path();
+                          p1.moveTo(14f, 26f);
+                          p1.quadTo(23f, 32f, 14f, 38f);
+                          Path p2 = new Path();
+                          p2.moveTo(26f, 19f);
+                          p2.quadTo(42f, 32f, 26f, 45f);
+                          Path p3 = new Path();
+                          p3.moveTo(38f, 12f);
+                          p3.quadTo(61f, 32f, 38f, 52f);
+                          canvas.drawPath(p1, stroke);
+                          canvas.drawPath(p2, stroke);
+                          canvas.drawPath(p3, stroke);
+                      } else {
+                          Path outer = new Path();
+                          outer.moveTo(24f, 56f);
+                          outer.cubicTo(32f, 56f, 36f, 50f, 36f, 44f);
+                          outer.cubicTo(36f, 37f, 48f, 35f, 48f, 24f);
+                          outer.cubicTo(48f, 14f, 40f, 7f, 30f, 7f);
+                          outer.cubicTo(20f, 7f, 14f, 14f, 14f, 25f);
+                          outer.lineTo(14f, 33f);
+                          Path inner = new Path();
+                          inner.moveTo(28f, 24f);
+                          inner.cubicTo(33f, 24f, 36f, 28f, 34f, 33f);
+                          inner.cubicTo(32f, 37f, 28f, 38f, 28f, 43f);
+                          canvas.drawPath(outer, stroke);
+                          canvas.drawPath(inner, stroke);
+                      }
+                      canvas.restore();
+                  }
+              }
+
+              // ------------------------------------------------------------------ Bluetooth classique (serveur RFCOMM)
+
+              private class LinkThread extends Thread {
+                  volatile boolean stopped = false;
+                  volatile boolean connected = false;
+                  volatile long lastLine = 0;
+                  private volatile BluetoothServerSocket server = null;
+                  private volatile BluetoothSocket socket = null;
+
+                  @Override
+                  public void run() {
+                      while (!stopped) {
+                          BluetoothAdapter ad = BluetoothAdapter.getDefaultAdapter();
+                          if (ad == null) {
+                              postWait("Bluetooth indisponible sur cette tablette");
+                              pause(3000);
+                              continue;
+                          }
+                          if (!ad.isEnabled()) {
+                              postWait("Activez le Bluetooth de la tablette");
+                              try {
+                                  ad.enable();
+                              } catch (Exception e) {
+                                  // l'adulte l'activera dans les reglages
+                              }
+                              pause(2500);
+                              continue;
+                          }
+                          try {
+                              if (server == null) {
+                                  server = ad.listenUsingRfcommWithServiceRecord(SERVICE_NAME, SERVICE_UUID);
+                                  postWait(WAIT_PHONE);
+                              }
+                              BluetoothSocket s = server.accept();
+                              socket = s;
+                              serve(s);
+                          } catch (IOException e) {
+                              closeServer();
+                              if (!stopped) {
+                                  pause(1000);
+                              }
+                          }
+                      }
+                      closeServer();
+                  }
+
+                  private void serve(final BluetoothSocket s) {
+                      connected = true;
+                      lastLine = System.currentTimeMillis();
+                      try {
+                          BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
+                          OutputStream out = s.getOutputStream();
+                          String line;
+                          while (!stopped && (line = in.readLine()) != null) {
+                              lastLine = System.currentTimeMillis();
+                              final String raw = line.trim();
+                              if (raw.length() == 0) {
+                                  continue;
+                              }
+                              out.write(OK_BYTES);
+                              out.flush();
+                              ui.post(new Runnable() {
+                                  @Override
+                                  public void run() {
+                                      onLine(raw);
+                                  }
+                              });
+                          }
+                      } catch (IOException e) {
+                          // liaison coupee : on repasse en ecoute
+                      } finally {
+                          connected = false;
+                          closeSocket(s);
+                          socket = null;
+                          postWait(WAIT_PHONE);
+                      }
+                  }
+
+                  private void postWait(final String text) {
+                      if (stopped) {
+                          return;
+                      }
+                      ui.post(new Runnable() {
+                          @Override
+                          public void run() {
+                              if (!stopped) {
+                                  showWaiting(text);
+                              }
+                          }
+                      });
+                  }
+
+                  void dropSocket() {
+                      closeSocket(socket);
+                  }
+
+                  void shutdown() {
+                      stopped = true;
+                      closeSocket(socket);
+                      closeServer();
+                      interrupt();
+                  }
+
+                  private void closeServer() {
+                      BluetoothServerSocket sv = server;
+                      server = null;
+                      if (sv != null) {
+                          try {
+                              sv.close();
+                          } catch (IOException e) {
+                              // deja ferme
+                          }
+                      }
+                  }
+
+                  private void closeSocket(BluetoothSocket s) {
+                      if (s != null) {
+                          try {
+                              s.close();
+                          } catch (IOException e) {
+                              // deja ferme
+                          }
+                      }
+                  }
+
+                  private void pause(long ms) {
+                      try {
+                          Thread.sleep(ms);
+                      } catch (InterruptedException e) {
+                          // arret demande
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Installer les composants Android
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+
+      - name: Compiler l'APK
+        run: gradle --no-daemon -p ecran assembleDebug
+
+      - name: Publier l'APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          cp ecran/app/build/outputs/apk/debug/app-debug.apk ecran-cantine.apk
+          gh release delete apk-tablette --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create apk-tablette ecran-cantine.apk --repo "$GITHUB_REPOSITORY" --title "APK de la tablette" --notes "Application Ecran cantine pour la tablette (Android 5.0 ou plus recent)."
