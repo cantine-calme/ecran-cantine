@@ -1,0 +1,500 @@
+# Construit l'APK du telephone (application "Mesure cantine") et le publie dans l'onglet Releases.
+# L'application affiche la page https://cantine-calme.github.io/mesure/ (copie embarquee) et fait elle-meme la liaison Bluetooth avec la tablette.
+name: Construire l'APK du telephone
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Creer le projet Android
+        run: |
+          set -e
+          mkdir -p telephone/app telephone/app/src/main telephone/app/src/main/assets telephone/app/src/main/java/fr/cantine/mesure
+          cat > telephone/settings.gradle <<'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "MesureCantine"
+          include ':app'
+          EOF_FILE
+          cat > telephone/build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+          }
+          EOF_FILE
+          cat > telephone/gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          EOF_FILE
+          cat > telephone/app/build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'fr.cantine.mesure'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'fr.cantine.mesure'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          EOF_FILE
+          cat > telephone/app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- Micro (mesure du bruit, rien n'est enregistre), Bluetooth classique (liaison avec la tablette). -->
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+              <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Mesure cantine"
+                  android:supportsRtl="false"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
+                      android:exported="true"
+                      android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > telephone/app/src/main/assets/shim.js <<'EOF_FILE'
+          (function () {
+            if (!window.AndroidBT) return;
+            var UUID = '5f3c2a10-8b6e-4d7a-9c41-2e6f0b7a1d93';
+            var pend = {}, seq = 0, rc = null, cur = null;
+            function call(fn, arg) {
+              return new Promise(function (res, rej) {
+                var id = ++seq; pend[id] = { res: res, rej: rej };
+                try { window.AndroidBT[fn](id, arg == null ? '' : String(arg)); }
+                catch (e) { delete pend[id]; rej(e); }
+              });
+            }
+            window.__btDone = function (id, ok, val) {
+              var p = pend[id]; if (!p) return; delete pend[id];
+              if (ok) p.res(val);
+              else p.rej(new DOMException(String(val), val === 'NotFoundError' ? 'NotFoundError' : 'NetworkError'));
+            };
+            window.__btData = function (s) { if (rc) { try { rc.enqueue(new TextEncoder().encode(s)); } catch (e) {} } };
+            window.__btClosed = function () { if (rc) { try { rc.close(); } catch (e) {} rc = null; } };
+            function Port(addr) { this.addr = addr; this.readable = null; this.writable = null; }
+            Port.prototype.getInfo = function () { return { bluetoothServiceClassId: UUID }; };
+            Port.prototype.open = function () {
+              var self = this;
+              return call('open', this.addr).then(function () {
+                self.readable = new ReadableStream({ start: function (c) { rc = c; } });
+                self.writable = new WritableStream({ write: function (chunk) { return call('write', new TextDecoder().decode(chunk)); } });
+              });
+            };
+            Port.prototype.close = function () {
+              var self = this;
+              return call('close', '').then(function () { self.readable = null; self.writable = null; });
+            };
+            Port.prototype.forget = function () { return call('forget', ''); };
+            function portFor(a) { if (!cur || cur.addr !== a) cur = new Port(a); return cur; }
+            var serial = {
+              requestPort: function () { return call('pick', '').then(portFor); },
+              getPorts: function () { return call('saved', '').then(function (a) { return a ? [portFor(a)] : []; }); }
+            };
+            Object.defineProperty(navigator, 'serial', { value: serial, configurable: true });
+          })();
+          EOF_FILE
+          cat > telephone/app/src/main/java/fr/cantine/mesure/MainActivity.java <<'EOF_FILE'
+          package fr.cantine.mesure;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothSocket;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.PermissionRequest;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.FrameLayout;
+
+          import org.json.JSONObject;
+
+          import java.io.ByteArrayInputStream;
+          import java.io.ByteArrayOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.nio.charset.Charset;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.UUID;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          /**
+           * Telephone : affiche la page "Mesure cantine" (copie embarquee, fonctionne sans reseau)
+           * et fait la liaison Bluetooth classique avec la tablette (application "Ecran cantine").
+           * La page parle a un faux "navigator.serial" (shim.js) qui s'appuie sur AndroidBT ci-dessous.
+           * Seuls la couleur, le message et l'etat sont transmis. Aucun son n'est envoye ni enregistre.
+           */
+          public class MainActivity extends Activity {
+              static final UUID SERVICE_UUID = UUID.fromString("5f3c2a10-8b6e-4d7a-9c41-2e6f0b7a1d93");
+              static final String PAGE = "https://cantine-calme.github.io/mesure/";
+              static final int REQ_MIC = 1, REQ_BT = 2;
+
+              private WebView web;
+              private FrameLayout root;
+              private View customView;
+              private WebChromeClient.CustomViewCallback customCb;
+              private PermissionRequest pendingMic;
+              private Runnable pendingBt;
+              private Runnable pendingBtDenied;
+              private SharedPreferences prefs;
+
+              private final Object lock = new Object();
+              private BluetoothSocket sock;
+              private OutputStream out;
+              private final ExecutorService io = Executors.newSingleThreadExecutor();
+              private final ExecutorService net = Executors.newCachedThreadPool();
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  prefs = getSharedPreferences("mesure", MODE_PRIVATE);
+                  root = new FrameLayout(this);
+                  web = new WebView(this);
+                  root.addView(web, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                  setContentView(root);
+
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setAllowFileAccess(false);
+                  s.setAllowContentAccess(false);
+
+                  web.addJavascriptInterface(new Bridge(), "AndroidBT");
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                          String u = r.getUrl().toString();
+                          int q = u.indexOf('?'); if (q >= 0) u = u.substring(0, q);
+                          int h = u.indexOf('#'); if (h >= 0) u = u.substring(0, h);
+                          if (u.equals(PAGE) || u.equals(PAGE + "index.html")) {
+                              try {
+                                  String html = new String(readAsset("index.html"), Charset.forName("UTF-8"));
+                                  String shim = new String(readAsset("shim.js"), Charset.forName("UTF-8"));
+                                  String tag = "<script>" + shim + "</script>";
+                                  int i = html.indexOf("<head>");
+                                  String res = i >= 0 ? html.substring(0, i + 6) + tag + html.substring(i + 6) : tag + html;
+                                  return new WebResourceResponse("text/html", "UTF-8", new ByteArrayInputStream(res.getBytes(Charset.forName("UTF-8"))));
+                              } catch (IOException e) { /* tombe sur la reponse vide ci-dessous */ }
+                          }
+                          // Tout le reste est bloque : l'application n'utilise aucun reseau.
+                          return new WebResourceResponse("text/plain", "UTF-8", new ByteArrayInputStream(new byte[0]));
+                      }
+                  });
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onPermissionRequest(final PermissionRequest req) {
+                          runOnUiThread(new Runnable() { public void run() { handleMic(req); } });
+                      }
+                      @Override
+                      public void onShowCustomView(View view, CustomViewCallback cb) {
+                          if (customView != null) { cb.onCustomViewHidden(); return; }
+                          customView = view; customCb = cb;
+                          root.addView(view, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                      }
+                      @Override
+                      public void onHideCustomView() { hideCustom(); }
+                  });
+                  web.loadUrl(PAGE);
+                  immersive();
+              }
+
+              private void hideCustom() {
+                  if (customView == null) return;
+                  root.removeView(customView);
+                  customView = null;
+                  if (customCb != null) customCb.onCustomViewHidden();
+                  customCb = null;
+              }
+
+              private byte[] readAsset(String name) throws IOException {
+                  InputStream in = getAssets().open(name);
+                  try {
+                      ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                      byte[] buf = new byte[8192]; int n;
+                      while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                      return bo.toByteArray();
+                  } finally { in.close(); }
+              }
+
+              private void immersive() {
+                  getWindow().getDecorView().setSystemUiVisibility(
+                          View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                          | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                          | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+              }
+
+              @Override
+              public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) immersive(); }
+
+              @Override
+              public void onBackPressed() {
+                  if (customView != null) { hideCustom(); return; }
+                  // Le retour est volontairement ignore : pour quitter, fermer l'application depuis la liste des applications recentes.
+              }
+
+              /* ---------- Micro ---------- */
+              private void handleMic(PermissionRequest req) {
+                  boolean wantsAudio = false;
+                  for (String r : req.getResources()) if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r)) wantsAudio = true;
+                  if (!wantsAudio) { req.deny(); return; }
+                  if (Build.VERSION.SDK_INT < 23 || checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                      req.grant(new String[] { PermissionRequest.RESOURCE_AUDIO_CAPTURE });
+                  } else {
+                      pendingMic = req;
+                      requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, REQ_MIC);
+                  }
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
+                  boolean ok = res.length > 0 && res[0] == PackageManager.PERMISSION_GRANTED;
+                  if (code == REQ_MIC && pendingMic != null) {
+                      if (ok) pendingMic.grant(new String[] { PermissionRequest.RESOURCE_AUDIO_CAPTURE }); else pendingMic.deny();
+                      pendingMic = null;
+                  } else if (code == REQ_BT) {
+                      Runnable go = pendingBt, no = pendingBtDenied;
+                      pendingBt = null; pendingBtDenied = null;
+                      if (ok && go != null) go.run(); else if (no != null) no.run();
+                  }
+              }
+
+              private boolean hasBtPermission() {
+                  return Build.VERSION.SDK_INT < 31 || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+              }
+
+              /* ---------- Retour vers la page ---------- */
+              private void js(final String code) {
+                  runOnUiThread(new Runnable() { public void run() { web.evaluateJavascript(code, null); } });
+              }
+              private void done(int id, boolean ok, String val) {
+                  js("window.__btDone(" + id + "," + ok + "," + JSONObject.quote(val == null ? "" : val) + ")");
+              }
+
+              /* ---------- Bluetooth ---------- */
+              private void closeSocket() {
+                  BluetoothSocket s; OutputStream o;
+                  synchronized (lock) { s = sock; o = out; sock = null; out = null; }
+                  try { if (o != null) o.close(); } catch (IOException e) {}
+                  try { if (s != null) s.close(); } catch (IOException e) {}
+              }
+
+              private void startReader(final BluetoothSocket s, final InputStream in) {
+                  net.execute(new Runnable() {
+                      public void run() {
+                          byte[] buf = new byte[1024];
+                          try {
+                              for (;;) {
+                                  int n = in.read(buf);
+                                  if (n < 0) break;
+                                  if (n > 0) js("window.__btData(" + JSONObject.quote(new String(buf, 0, n, Charset.forName("UTF-8"))) + ")");
+                              }
+                          } catch (IOException e) { /* liaison coupee */ }
+                          boolean mine;
+                          synchronized (lock) { mine = (sock == s); if (mine) { sock = null; out = null; } }
+                          try { s.close(); } catch (IOException e) {}
+                          if (mine) js("window.__btClosed()");
+                      }
+                  });
+              }
+
+              private void doOpen(final int id, final String addr) {
+                  net.execute(new Runnable() {
+                      public void run() {
+                          closeSocket();
+                          BluetoothAdapter ad = BluetoothAdapter.getDefaultAdapter();
+                          if (ad == null || !ad.isEnabled()) { done(id, false, "Bluetooth desactive"); return; }
+                          if (!hasBtPermission()) { done(id, false, "Autorisation Bluetooth manquante"); return; }
+                          BluetoothSocket s = null;
+                          try {
+                              ad.cancelDiscovery();
+                              BluetoothDevice d = ad.getRemoteDevice(addr);
+                              try {
+                                  s = d.createRfcommSocketToServiceRecord(SERVICE_UUID);
+                                  s.connect();
+                              } catch (IOException e1) {
+                                  try { if (s != null) s.close(); } catch (IOException e) {}
+                                  s = d.createInsecureRfcommSocketToServiceRecord(SERVICE_UUID);
+                                  s.connect();
+                              }
+                              synchronized (lock) { sock = s; out = s.getOutputStream(); }
+                              startReader(s, s.getInputStream());
+                              done(id, true, "");
+                          } catch (Exception e) {
+                              try { if (s != null) s.close(); } catch (IOException x) {}
+                              done(id, false, "Connexion impossible");
+                          }
+                      }
+                  });
+              }
+
+              private void doPick(final int id) {
+                  runOnUiThread(new Runnable() {
+                      public void run() {
+                          if (!hasBtPermission()) {
+                              pendingBt = new Runnable() { public void run() { showPicker(id); } };
+                              pendingBtDenied = new Runnable() { public void run() { done(id, false, "NotFoundError"); } };
+                              requestPermissions(new String[] { Manifest.permission.BLUETOOTH_CONNECT }, REQ_BT);
+                          } else showPicker(id);
+                      }
+                  });
+              }
+
+              private void showPicker(final int id) {
+                  BluetoothAdapter ad = BluetoothAdapter.getDefaultAdapter();
+                  if (ad == null || !ad.isEnabled()) { done(id, false, "NotFoundError"); return; }
+                  final List<BluetoothDevice> list = new ArrayList<BluetoothDevice>();
+                  for (BluetoothDevice d : ad.getBondedDevices()) {
+                      String n = d.getName() == null ? "" : d.getName().toLowerCase();
+                      if (n.contains("kurio")) list.add(0, d); else list.add(d);
+                  }
+                  if (list.isEmpty()) { done(id, false, "NotFoundError"); return; }
+                  String[] labels = new String[list.size()];
+                  for (int i = 0; i < labels.length; i++) {
+                      String n = list.get(i).getName();
+                      labels[i] = (n == null || n.length() == 0) ? list.get(i).getAddress() : n;
+                  }
+                  new AlertDialog.Builder(this)
+                          .setTitle("Choisir la tablette")
+                          .setItems(labels, new android.content.DialogInterface.OnClickListener() {
+                              public void onClick(android.content.DialogInterface dlg, int which) {
+                                  String a = list.get(which).getAddress();
+                                  prefs.edit().putString("addr", a).apply();
+                                  done(id, true, a);
+                              }
+                          })
+                          .setOnCancelListener(new android.content.DialogInterface.OnCancelListener() {
+                              public void onCancel(android.content.DialogInterface dlg) { done(id, false, "NotFoundError"); }
+                          })
+                          .show();
+              }
+
+              private class Bridge {
+                  @JavascriptInterface public void pick(int id, String a) { doPick(id); }
+                  @JavascriptInterface public void saved(int id, String a) { done(id, true, prefs.getString("addr", "")); }
+                  @JavascriptInterface public void open(int id, String a) { doOpen(id, a); }
+                  @JavascriptInterface public void close(int id, String a) { closeSocket(); done(id, true, ""); }
+                  @JavascriptInterface public void forget(int id, String a) { closeSocket(); prefs.edit().remove("addr").apply(); done(id, true, ""); }
+                  @JavascriptInterface public void write(final int id, final String text) {
+                      io.execute(new Runnable() {
+                          public void run() {
+                              OutputStream o;
+                              synchronized (lock) { o = out; }
+                              if (o == null) { done(id, false, "Liaison fermee"); return; }
+                              try { o.write(text.getBytes(Charset.forName("UTF-8"))); o.flush(); done(id, true, ""); }
+                              catch (IOException e) {
+                                  BluetoothSocket s; synchronized (lock) { s = sock; }
+                                  try { if (s != null) s.close(); } catch (IOException x) {}
+                                  done(id, false, "Ecriture impossible");
+                              }
+                          }
+                      });
+                  }
+              }
+
+              @Override
+              protected void onDestroy() { closeSocket(); super.onDestroy(); }
+          }
+          EOF_FILE
+
+      - name: Recuperer la page Mesure cantine
+        run: |
+          set -e
+          curl -fsSL --retry 3 https://cantine-calme.github.io/mesure/index.html -o telephone/app/src/main/assets/index.html
+          grep -q "btConnect" telephone/app/src/main/assets/index.html
+          grep -q "<head>" telephone/app/src/main/assets/index.html
+          wc -c telephone/app/src/main/assets/index.html
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+
+      - name: Compiler l'APK
+        run: gradle --no-daemon -p telephone assembleDebug
+
+      - name: Publier l'APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          cp telephone/app/build/outputs/apk/debug/app-debug.apk mesure-cantine.apk
+          gh release delete apk-telephone --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create apk-telephone mesure-cantine.apk --repo "$GITHUB_REPOSITORY" --title "APK du telephone" --notes "Application Mesure cantine pour le telephone (Android 5.0 ou plus recent)."
